@@ -1,0 +1,30 @@
+# Caddy front end for the PHP-FPM container (see Dockerfile).
+#
+# Allowlist by construction: there is no file_server, so the only thing this
+# site can hand out is the output of hetzner_dyndns.php, reachable exclusively
+# through the two DynDNS aliases. `handle` blocks are mutually exclusive, so a
+# direct request to /hetzner_dyndns.php, to the sqlite database, to the config
+# file — or to any file added to the repository later — falls through to the
+# 404 below without needing to be blocklisted.
+#
+# Do NOT add file_server: the document root holds the config and, by default,
+# the sqlite database, and .htaccess is inert under FPM. The app serves no
+# static assets, so there is nothing to gain and a database to lose.
+#
+# For direct exposure, replace :80 with the hostname so Caddy provisions TLS:
+#   dyndns.example.com { ... }
+:80 {
+	# Needed so SCRIPT_FILENAME resolves inside the FPM container, even though
+	# Caddy itself never reads from this directory.
+	root * /var/www/html
+
+	@dyndns path /nic/update /v3/update
+	handle @dyndns {
+		rewrite * /hetzner_dyndns.php
+		php_fastcgi ddns-fpm:9000
+	}
+
+	handle {
+		respond 404
+	}
+}
