@@ -147,6 +147,17 @@ function get_realm_config(array $config, string $realmKey): array
     $realm['api_order'] = array_values(array_filter($realm['api_order'] ?? ['dns', 'console']));
     $realm['zone_name'] = trim($realm['zone_name'] ?? '');
 
+    // Optional Hetzner Cloud Firewall sync; disabled unless explicitly enabled.
+    $firewall = (array) ($realm['firewall'] ?? []);
+    $realm['firewall'] = [
+        'enabled' => !empty($firewall['enabled']),
+        'firewall_id' => $firewall['firewall_id'] ?? null,
+        'firewall_name' => trim((string) ($firewall['firewall_name'] ?? '')),
+        'port' => trim((string) ($firewall['port'] ?? '')),
+        'protocol' => strtolower(trim((string) ($firewall['protocol'] ?? 'tcp'))),
+        'rule_description' => trim((string) ($firewall['rule_description'] ?? '')),
+    ];
+
     return $realm;
 }
 
@@ -381,6 +392,20 @@ function sync_host(SQLite3 $db, array $config, string $realmKey, array $realmCon
 {
     // Attempt to update DNS records by iterating over all configured APIs until one succeeds.
     $attempt = try_update($realmConfig, $domain, $zoneName, $hostnameName, $ips, $historyRow);
+
+    // Keep the optional Hetzner Cloud Firewall rule pointed at the new address.
+    // A firewall failure flags the row as pending so the next client poll retries
+    // both steps; the record update itself is idempotent, so re-running is safe.
+    if ($attempt['success'] && !empty($realmConfig['firewall']['enabled'])) {
+        $firewallResult = update_firewall($realmConfig, $ips);
+        if ($firewallResult['success']) {
+            $attempt['message'] .= ' | ' . $firewallResult['message'];
+        } else {
+            $attempt['success'] = false;
+            $attempt['message'] = 'Firewall update failed: ' . $firewallResult['message'];
+        }
+    }
+
     $needsSync = !$attempt['success'];
     $retryCount = $needsSync ? min(($historyRow['retry_count'] ?? 0) + 1, $config['max_retry_attempts'] ?? 5) : 0;
     $pendingSince = $needsSync ? ($historyRow['pending_since'] ?? time()) : null;
@@ -1004,6 +1029,131 @@ function console_set_rrset(string $endpoint, string $token, string $zoneId, arra
         'Content-Type: application/json',
         'Authorization: Bearer ' . $token,
     ], $payload);
+}
+
+/**
+ * Point an existing Hetzner Cloud Firewall rule at the current dynamic IP.
+ *
+ * Uses the same console endpoint/token as the rrset updates. The rule must
+ * already exist; this only rewrites its source_ips. Because the set_rules
+ * action replaces the ENTIRE rule set, every untouched rule is sent back
+ * unchanged alongside the modified one.
+ */
+function update_firewall(array $realmConfig, array $ips): array
+{
+    $fw = $realmConfig['firewall'];
+    $endpoint = $realmConfig['console_endpoint'];
+    $token = (string) ($realmConfig['console_token'] ?? '');
+
+    if ($token === '') {
+        return ['success' => false, 'message' => 'console_token required for firewall updates'];
+    }
+    if ($fw['port'] === '') {
+        return ['success' => false, 'message' => 'firewall.port is not configured'];
+    }
+
+    $firewall = fetch_firewall($endpoint, $token, $fw);
+    if (!$firewall['success']) {
+        return $firewall;
+    }
+
+    $sourceIps = [$ips['ipv4'] . '/32'];
+    if (!empty($ips['ipv6'])) {
+        $sourceIps[] = $ips['ipv6'] . '/128';
+    }
+
+    $rules = $firewall['rules'];
+    $matched = 0;
+    foreach ($rules as $index => $rule) {
+        if (($rule['direction'] ?? '') !== 'in') {
+            continue;
+        }
+        if (strtolower((string) ($rule['protocol'] ?? '')) !== $fw['protocol']) {
+            continue;
+        }
+        if ((string) ($rule['port'] ?? '') !== $fw['port']) {
+            continue;
+        }
+        if ($fw['rule_description'] !== '' && (string) ($rule['description'] ?? '') !== $fw['rule_description']) {
+            continue;
+        }
+        $rules[$index]['source_ips'] = $sourceIps;
+        $matched++;
+    }
+
+    if ($matched === 0) {
+        return ['success' => false, 'message' => sprintf(
+            'No firewall rule matched in/%s port %s%s',
+            $fw['protocol'],
+            $fw['port'],
+            $fw['rule_description'] !== '' ? ' description "' . $fw['rule_description'] . '"' : ''
+        )];
+    }
+
+    log_debug(sprintf(
+        'Setting firewall %s source_ips to %s on %d rule(s)',
+        $firewall['id'],
+        implode(',', $sourceIps),
+        $matched
+    ));
+    $response = http_request('POST', $endpoint . '/firewalls/' . urlencode($firewall['id']) . '/actions/set_rules', [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $token,
+    ], ['rules' => normalize_firewall_rules($rules)]);
+
+    if (!$response['success']) {
+        return ['success' => false, 'message' => $response['error'] ?? 'Firewall set_rules failed'];
+    }
+
+    return ['success' => true, 'message' => sprintf('Firewall rule updated (%d rule(s) -> %s)', $matched, implode(', ', $sourceIps))];
+}
+
+/**
+ * Resolve the configured firewall (by id or name) to its id plus rule list.
+ */
+function fetch_firewall(string $endpoint, string $token, array $fw): array
+{
+    $headers = [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $token,
+    ];
+
+    if (!empty($fw['firewall_id'])) {
+        $response = http_request('GET', $endpoint . '/firewalls/' . urlencode((string) $fw['firewall_id']), $headers);
+        $firewall = $response['data']['firewall'] ?? null;
+    } elseif ($fw['firewall_name'] !== '') {
+        $response = http_request('GET', $endpoint . '/firewalls?name=' . urlencode($fw['firewall_name']), $headers);
+        $firewall = $response['data']['firewalls'][0] ?? null;
+    } else {
+        return ['success' => false, 'message' => 'firewall_id or firewall_name is required'];
+    }
+
+    if (!$response['success'] || !$firewall) {
+        return ['success' => false, 'message' => $response['error'] ?? 'Firewall not found'];
+    }
+
+    return ['success' => true, 'id' => (string) $firewall['id'], 'rules' => $firewall['rules'] ?? []];
+}
+
+/**
+ * Reduce fetched rules to the fields set_rules accepts and strip null values
+ * (e.g. icmp rules carry no port), so the rule set round-trips unmodified.
+ */
+function normalize_firewall_rules(array $rules): array
+{
+    $allowed = ['direction', 'protocol', 'port', 'source_ips', 'destination_ips', 'description'];
+    $normalized = [];
+    foreach ($rules as $rule) {
+        $entry = [];
+        foreach ($allowed as $key) {
+            if (array_key_exists($key, $rule) && $rule[$key] !== null) {
+                $entry[$key] = $rule[$key];
+            }
+        }
+        $normalized[] = $entry;
+    }
+
+    return $normalized;
 }
 
 /**

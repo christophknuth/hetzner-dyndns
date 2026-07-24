@@ -67,6 +67,21 @@ return [
             // Optional override if the zone uses a subdomain (e.g. ddns.example.com).
             'zone_name' => 'ddns.example.com',
             'api_order' => ['dns', 'console'],
+            // Optional: keep an existing Hetzner Cloud Firewall rule pointed at the
+            // dynamic IP (e.g. so the Hawser port stays reachable only from home).
+            // Uses the same console_token/project as the Console API updates.
+            'firewall' => [
+                'enabled' => false,
+                // Identify the firewall by name or numeric id (id wins if both set).
+                'firewall_name' => 'my-firewall',
+                // 'firewall_id' => 12345,
+                // Rule to update, matched by direction "in" + protocol + port.
+                'port' => '2222',
+                'protocol' => 'tcp',
+                // Recommended: only touch rules carrying exactly this description,
+                // so other rules on the same port stay untouched.
+                'rule_description' => 'hawser-ddns',
+            ],
         ],
     ],
 ];

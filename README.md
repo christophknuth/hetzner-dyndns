@@ -30,6 +30,12 @@
 - Optionally add `'zone_name' => 'your-zone.example.com'` per realm when the DNS zone sits under a subdomain; otherwise the updater infers the domain automatically.
 - Add or adjust realms, tokens, and TTL values in that file, then rerun the cron to refresh pending rows.
 
+## Firewall sync (optional)
+- Add a `firewall` block to a realm to keep an existing Hetzner Cloud Firewall rule pointed at the current dynamic IP (e.g. so a service port stays reachable only from home). It uses the same `console_token`/project as the Console API updates.
+- Configure `enabled`, `firewall_name` (or `firewall_id`), `port`, `protocol` (default `tcp`), and preferably `rule_description`: only inbound rules matching protocol + port — and, when set, exactly that description — get their `source_ips` replaced with the new IPv4/32 (plus IPv6/128 when present). Other rules on the same port stay untouched.
+- The rule must already exist; the script updates it but never creates one. Because Hetzner's `set_rules` action replaces the whole rule set, the script always sends every other rule back unchanged.
+- A failed firewall update marks the host as pending (HTTP 503), so the next client poll retries both the record and the firewall even if the IP has not changed again.
+
 ## Notifications
 - Enable `'notifications.enabled' => true` to send an email after each update attempt.
 - Set `'notifications.method'` to `'php'` to use `mail()` or `'smtp'` to speak directly to an authenticated SMTP server.
