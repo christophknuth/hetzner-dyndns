@@ -3,11 +3,16 @@
  * Hetzner DNS Dynamic DNS configuration.
  *
  * Adjust the realms array below to match your zones, tokens, and preferences.
- * Each realm can define its own TTL, API endpoint tokens, and preferred order
- * of DNS providers (classic KonsoleH/dns plus the new Hetzner Console API).
+ * Each realm defines its own TTL and Hetzner Console API token.
  *
  * Copy this file to hetzner_dyndns.config.php, fill in the real tokens and passwords,
  * and keep it out of version control.
+ *
+ * Upgrading: the legacy dns.hetzner.com API has been shut down by Hetzner and its
+ * support was removed. 'dns_token', 'dns_endpoint' and 'api_order' are no longer
+ * read and can be deleted; existing configs keep working without changes. Existing
+ * sqlite databases need no migration — their unused recordA_id/recordAAAA_id
+ * columns are simply left in place.
  */
 
 return [
@@ -18,7 +23,8 @@ return [
     // Authentication realm label used when sending WWW-Authenticate headers.
     'auth_realm' => 'Your Realm Name',
 
-    // Local sqlite file that keeps track of pending updates.
+    // Local sqlite file that keeps track of pending updates. Keep this key: it is
+    // what makes state survive between requests.
     'history_db' => __DIR__ . '/hetzner_dyndns.sqlite3',
 
     // Enable verbose output when troubleshooting (false for production).
@@ -49,24 +55,17 @@ return [
     // Fallback realm if the request does not supply one.
     'default_realm' => 'default',
 
-    // Number of seconds cron handler should wait to acquire database lock.
-    'lock_wait_seconds' => 5,
-
-    // Maximum retry attempts before cron keeps waiting for manual intervention.
+    // Upper bound for the retry counter recorded per host after a failed update.
     'max_retry_attempts' => 5,
 
     // Define your realms/zones and credentials below.
     'realms' => [
         'default' => [
-            'name' => 'default',
             'ttl' => 60,
-            'dns_endpoint' => 'https://dns.hetzner.com/api/v1',
             'console_endpoint' => 'https://api.hetzner.cloud/v1',
-            'dns_token' => 'your-dns-api-token',
             'console_token' => 'your-console-api-token',
             // Optional override if the zone uses a subdomain (e.g. ddns.example.com).
             'zone_name' => 'ddns.example.com',
-            'api_order' => ['dns', 'console'],
             // Optional: keep an existing Hetzner Cloud Firewall rule pointed at the
             // dynamic IP (e.g. so the Hawser port stays reachable only from home).
             // Uses the same console_token/project as the Console API updates.
@@ -78,8 +77,10 @@ return [
                 // Rule to update, matched by direction "in" + protocol + port.
                 'port' => '2222',
                 'protocol' => 'tcp',
-                // Recommended: only touch rules carrying exactly this description,
-                // so other rules on the same port stay untouched.
+                // Strongly recommended: only touch rules carrying exactly this
+                // description, so other rules on the same port stay untouched.
+                // Without it, an update that matches more than one rule is refused
+                // rather than rewriting somebody else's access.
                 'rule_description' => 'hawser-ddns',
             ],
         ],

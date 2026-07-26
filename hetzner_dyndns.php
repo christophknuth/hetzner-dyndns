@@ -14,6 +14,16 @@
  * `?action=cron` endpoint, which keeps history rows flagged when API calls fail.
  */
 
+// Turn bootstrap failures (unreadable config, unusable database) into a plain 500
+// instead of a stack trace, and keep the details in the log where they belong.
+set_exception_handler(static function (Throwable $e): void {
+    error_log('[Hetzner DDNS] ' . $e::class . ': ' . $e->getMessage());
+    if (!headers_sent()) {
+        http_response_code(500);
+    }
+    echo 'Internal error';
+});
+
 $config = load_config(__DIR__ . '/hetzner_dyndns.config.php');
 $debug = $config['debug'] ?? false;
 
@@ -22,17 +32,20 @@ if (!class_exists('SQLite3')) {
     exit('SQLite3 support is not available in this PHP installation.');
 }
 
-$db = new DDnsDB($config);
 $cronContext = get_cron_context();
 
+// Authenticate BEFORE touching the database: opening it first meant an unusable
+// database file emitted PHP warnings to unauthenticated callers, and that output
+// sent the headers early so the 401 below could never take effect.
+authenticate($config);
+
+$db = new DDnsDB($config);
+
 if ($cronContext['is_cron']) {
-    authenticate($config);
     $summary = process_pending_updates($db, $config, $cronContext['realm']);
     echo render_cron_summary($summary);
     exit;
 }
-
-authenticate($config);
 
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     header('HTTP/1.0 405 Method Not Allowed');
@@ -88,7 +101,7 @@ if (should_skip_update($historyRow, $ips)) {
     exit;
 }
 
-$result = sync_host($db, $config, $realmKey, $realmConfig, $hostname, $domain, $zoneLookupName, $hostnameName, $ips, $historyRow);
+$result = sync_host($db, $config, $realmKey, $realmConfig, $hostname, $zoneLookupName, $hostnameName, $ips, $historyRow);
 send_notification($config['notifications'] ?? [], $realmKey, $hostname, $ips, $result);
 if ($result['success']) {
     echo 'good ' . $ips['ipv4'];
@@ -141,11 +154,15 @@ function get_realm_config(array $config, string $realmKey): array
         throw new RuntimeException('Realm not defined: ' . $realmKey);
     }
 
-    $realm['dns_endpoint'] = rtrim($realm['dns_endpoint'] ?? 'https://dns.hetzner.com/api/v1', '/');
     $realm['console_endpoint'] = rtrim($realm['console_endpoint'] ?? 'https://api.hetzner.cloud/v1', '/');
     $realm['ttl'] = $realm['ttl'] ?? 60;
-    $realm['api_order'] = array_values(array_filter($realm['api_order'] ?? ['dns', 'console']));
     $realm['zone_name'] = trim($realm['zone_name'] ?? '');
+
+    // Leftovers from the retired dns.hetzner.com backend. Old configs keep working;
+    // the keys are simply ignored.
+    if (isset($realm['dns_token']) || isset($realm['dns_endpoint']) || isset($realm['api_order'])) {
+        log_debug(sprintf('Realm %s still defines dns_token/dns_endpoint/api_order; ignored since the legacy DNS API was removed.', $realmKey));
+    }
 
     // Optional Hetzner Cloud Firewall sync; disabled unless explicitly enabled.
     $firewall = (array) ($realm['firewall'] ?? []);
@@ -186,6 +203,12 @@ function get_cron_context(): array
  */
 function authenticate(array $config): void
 {
+    // CLI runs (cron) carry no HTTP credentials. Anyone able to execute the script
+    // locally can already read the config file, so there is nothing left to guard.
+    if (PHP_SAPI === 'cli') {
+        return;
+    }
+
     $realmLabel = $config['auth_realm'] ?? 'My Dynamic DNS service';
     $user = trim((string) ($config['auth_user'] ?? ''));
     if ($user === '') {
@@ -200,14 +223,10 @@ function authenticate(array $config): void
     }
     $authValue = $_SERVER['HTTP_X_AUTHENTICATION'] ?? null;
 
-    if (isset($_SERVER['PHP_AUTH_DIGEST'])) {
-        $digest = $_SERVER['PHP_AUTH_DIGEST'];
-        $expected = md5($user . ':' . $passwords[0]);
-        if (strpos($digest, 'username="' . $user . '"') === false || strpos($digest, 'response="' . $expected . '"') === false) {
-            send_auth_headers($realmLabel);
-        }
-        return;
-    }
+    // NOTE: a PHP_AUTH_DIGEST branch used to sit here. It compared the response
+    // against md5("user:password"), which is not an RFC 7616 digest response
+    // (MD5(HA1:nonce:HA2)) — no real digest client could ever match it. Worse, it
+    // returned early and thereby skipped every working method below. Removed.
 
     if (isset($_SERVER['PHP_AUTH_USER'], $_SERVER['PHP_AUTH_PW'])) {
         foreach ($passwords as $password) {
@@ -357,11 +376,9 @@ function fetch_history_row(SQLite3 $db, string $hostname): ?array
         return null;
     }
 
-    // Convert empty strings back to null so logic that expects "missing" IDs works consistently.
-    foreach (['zone_id', 'recordA_id', 'recordAAAA_id'] as $key) {
-        if (isset($row[$key]) && $row[$key] === '') {
-            $row[$key] = null;
-        }
+    // Convert the empty string back to null so logic that expects a "missing" ID works consistently.
+    if (isset($row['zone_id']) && $row['zone_id'] === '') {
+        $row['zone_id'] = null;
     }
 
     return $row;
@@ -388,10 +405,17 @@ function should_skip_update(?array $row, array $ips): bool
 /**
  * Coordinate the update attempt, record the results, and mark rows for cron retries when needed.
  */
-function sync_host(SQLite3 $db, array $config, string $realmKey, array $realmConfig, string $hostname, string $domain, string $zoneName, string $hostnameName, array $ips, ?array $historyRow): array
+function sync_host(SQLite3 $db, array $config, string $realmKey, array $realmConfig, string $hostname, string $zoneName, string $hostnameName, array $ips, ?array $historyRow): array
 {
-    // Attempt to update DNS records by iterating over all configured APIs until one succeeds.
-    $attempt = try_update($realmConfig, $domain, $zoneName, $hostnameName, $ips, $historyRow);
+    if (empty($realmConfig['console_token'])) {
+        $attempt = [
+            'success' => false,
+            'message' => 'No console_token configured for realm ' . $realmKey,
+            'zone_id' => $historyRow['zone_id'] ?? null,
+        ];
+    } else {
+        $attempt = update_via_console_api($realmConfig, $zoneName, $hostnameName, $ips, $historyRow['zone_id'] ?? null);
+    }
 
     // Keep the optional Hetzner Cloud Firewall rule pointed at the new address.
     // A firewall failure flags the row as pending so the next client poll retries
@@ -414,9 +438,7 @@ function sync_host(SQLite3 $db, array $config, string $realmKey, array $realmCon
         $hostname,
         $realmKey,
         $ips,
-        $attempt['zone_id'],
-        $attempt['recordA_id'],
-        $attempt['recordAAAA_id'],
+        $attempt['zone_id'] ?? null,
         $needsSync,
         $retryCount,
         $attempt['message'],
@@ -424,138 +446,6 @@ function sync_host(SQLite3 $db, array $config, string $realmKey, array $realmCon
     );
 
     return $attempt;
-}
-
-/**
- * Attempt each configured API in order, carrying over the latest zone/record IDs.
- */
-function try_update(array $realmConfig, string $domain, string $zoneName, string $hostnameName, array $ips, ?array $historyRow): array
-{
-    $zoneId = $historyRow['zone_id'] ?? null;
-    $recordAId = $historyRow['recordA_id'] ?? null;
-    $recordAAAAId = $historyRow['recordAAAA_id'] ?? null;
-    $errors = [];
-
-    foreach ($realmConfig['api_order'] as $api) {
-        if ($api === 'dns') {
-            if (empty($realmConfig['dns_token'])) {
-                continue;
-            }
-            $response = update_via_dns_api($realmConfig, $domain, $zoneName, $hostnameName, $ips, $zoneId, $recordAId, $recordAAAAId);
-        } elseif ($api === 'console') {
-            if (empty($realmConfig['console_token'])) {
-                continue;
-            }
-            $response = update_via_console_api($realmConfig, $zoneName, $hostnameName, $ips, null);
-        } else {
-            continue;
-        }
-
-        $zoneId = $response['zone_id'] ?? $zoneId;
-        $recordAId = $response['recordA_id'] ?? $recordAId;
-        $recordAAAAId = $response['recordAAAA_id'] ?? $recordAAAAId;
-
-        if ($response['success']) {
-            return array_merge($response, [
-                'zone_id' => $zoneId,
-                'recordA_id' => $recordAId,
-                'recordAAAA_id' => $recordAAAAId,
-                'api_used' => $api,
-            ]);
-        }
-
-        $errors[] = sprintf('%s API error: %s', strtoupper($api), $response['message']);
-    }
-
-    return [
-        'success' => false,
-        'message' => implode(' | ', $errors) ?: 'No API configured',
-        'zone_id' => $zoneId,
-        'recordA_id' => $recordAId,
-        'recordAAAA_id' => $recordAAAAId,
-    ];
-}
-
-/**
- * Update the legacy Hetzner DNS zone/records, looking up record IDs when missing.
- */
-function update_via_dns_api(array $realmConfig, string $domain, string $zoneName, string $hostnameName, array $ips, ?string $zoneId, ?string $recordAId, ?string $recordAAAAId): array
-{
-    $ttl = $realmConfig['ttl'];
-    $endpoint = $realmConfig['dns_endpoint'];
-    $token = $realmConfig['dns_token'];
-    log_debug(sprintf('DNS API update prepared for %s (%s) in zone "%s" via %s', $hostnameName, $domain, $zoneName, $endpoint));
-
-    if (!$zoneId) {
-        $zoneId = fetch_zone_id($endpoint, $token, $zoneName);
-        if (!$zoneId) {
-            log_debug(sprintf('DNS API zone lookup failed for "%s" (derived "%s")', $zoneName, $domain));
-            return ['success' => false, 'message' => 'Zone not found', 'zone_id' => null];
-        }
-        log_debug(sprintf('DNS API resolved zone "%s" to id %s', $zoneName, $zoneId));
-    }
-
-    if (!$recordAId || !$recordAAAAId) {
-        $records = fetch_records($endpoint, $token, $zoneId, $hostnameName);
-        $recordAId = $recordAId ?: $records['A'] ?? null;
-        $recordAAAAId = $recordAAAAId ?: $records['AAAA'] ?? null;
-    }
-
-    if (!$recordAId) {
-        return ['success' => false, 'message' => 'Missing A record ID', 'zone_id' => $zoneId];
-    }
-
-    $payload = [
-        'value' => $ips['ipv4'],
-        'ttl' => $ttl,
-        'type' => 'A',
-        'name' => $hostnameName,
-        'zone_id' => $zoneId,
-    ];
-
-    $response = http_request('PUT', $endpoint . '/records/' . $recordAId, [
-        'Content-Type: application/json',
-        'Auth-API-Token: ' . $token,
-    ], $payload);
-
-        log_debug(sprintf('DNS API AAAA-record update returned %s', $response['success'] ? 'success' : 'failure'));
-        if (!$response['success']) {
-            return [
-            'success' => false,
-            'message' => $response['error'] ?? 'Failed to update A record',
-            'zone_id' => $zoneId,
-        ];
-    }
-
-    if ($ips['ipv6'] && $recordAAAAId) {
-        $payload = [
-            'value' => $ips['ipv6'],
-            'ttl' => $ttl,
-            'type' => 'AAAA',
-            'name' => $hostnameName,
-            'zone_id' => $zoneId,
-        ];
-        $response = http_request('PUT', $endpoint . '/records/' . $recordAAAAId, [
-            'Content-Type: application/json',
-            'Auth-API-Token: ' . $token,
-        ], $payload);
-        if (!$response['success']) {
-            return [
-                'success' => false,
-                'message' => $response['error'] ?? 'Failed to update AAAA record',
-                'zone_id' => $zoneId,
-                'recordA_id' => $recordAId,
-            ];
-        }
-    }
-
-    return [
-        'success' => true,
-        'message' => 'DNS record updated via classic API',
-        'zone_id' => $zoneId,
-        'recordA_id' => $recordAId,
-        'recordAAAA_id' => $recordAAAAId,
-    ];
 }
 
 /**
@@ -569,32 +459,39 @@ function update_via_console_api(array $realmConfig, string $zoneName, string $ho
     log_debug(sprintf('Console API update prepared for %s in zone "%s"', $hostnameName, $zoneName));
 
     if (!$zoneId) {
-        $zoneId = fetch_console_zone_id($endpoint, $token, $zoneName);
-        if (!$zoneId) {
-            log_debug(sprintf('Console API zone lookup failed for "%s"', $zoneName));
-            return ['success' => false, 'message' => 'Zone not found on console API'];
+        $lookup = fetch_console_zone_id($endpoint, $token, $zoneName);
+        if (!$lookup['success']) {
+            log_debug(sprintf('Console API zone lookup failed for "%s": %s', $zoneName, $lookup['message']));
+            return ['success' => false, 'message' => $lookup['message'], 'zone_id' => null];
         }
+        $zoneId = $lookup['zone_id'];
         log_debug(sprintf('Console API resolved zone "%s" to id %s', $zoneName, $zoneId));
     }
 
-    $ttl = $realmConfig['ttl'];
+    // Every failure path below returns zone_id => null on purpose: a cached id that
+    // no longer resolves (zone deleted and recreated) would otherwise stick forever,
+    // and dropping it costs nothing but one extra lookup on the next attempt.
     $nameCandidates = build_rrset_candidates($hostnameName);
     $updates = [
         'A' => $ips['ipv4'],
         'AAAA' => $ips['ipv6'],
     ];
-    $hadMissing = false;
+    $missingTypes = [];
 
     foreach ($updates as $type => $value) {
         if (empty($value)) {
             continue;
         }
 
-        $existing = fetch_console_rrsets($endpoint, $token, $zoneId, $type);
-        $chosen = choose_rrset_name($existing, $nameCandidates);
+        $rrsets = fetch_console_rrsets($endpoint, $token, $zoneId, $type);
+        if (!$rrsets['success']) {
+            return ['success' => false, 'message' => $rrsets['message'], 'zone_id' => null];
+        }
+
+        $chosen = choose_rrset_name($rrsets['rrsets'], $nameCandidates);
         if ($chosen === null) {
             log_debug(sprintf('No console rrset found for type %s among %s; skipping', $type, json_encode($nameCandidates)));
-            $hadMissing = true;
+            $missingTypes[] = $type;
             continue;
         }
 
@@ -611,16 +508,21 @@ function update_via_console_api(array $realmConfig, string $zoneName, string $ho
             return [
                 'success' => false,
                 'message' => $response['error'] ?? 'Console API update failed',
-                'zone_id' => $zoneId,
+                'zone_id' => null,
             ];
         }
     }
 
-    if ($hadMissing) {
+    if ($missingTypes !== []) {
         return [
             'success' => false,
-            'message' => 'Console rrset names missing',
-            'zone_id' => $zoneId,
+            'message' => sprintf(
+                'No %s rrset exists for "%s" in zone "%s"; create it once in the Hetzner console',
+                implode('/', $missingTypes),
+                $hostnameName,
+                $zoneName
+            ),
+            'zone_id' => null,
         ];
     }
 
@@ -631,53 +533,36 @@ function update_via_console_api(array $realmConfig, string $zoneName, string $ho
     ];
 }
 
-function fetch_zone_id(string $endpoint, string $token, string $zoneName): ?string
-{
-    $response = http_request('GET', $endpoint . '/zones?name=' . urlencode($zoneName), [
-        'Content-Type: application/json',
-        'Auth-API-Token: ' . $token,
-    ]);
-
-    $zones = $response['data']['zones'] ?? [];
-    if (!empty($zones)) {
-        return $zones[0]['id'] ?? null;
-    }
-
-    return null;
-}
-
-function fetch_records(string $endpoint, string $token, string $zoneId, string $hostnameName): array
-{
-    $response = http_request('GET', $endpoint . '/records?zone_id=' . urlencode($zoneId), [
-        'Content-Type: application/json',
-        'Auth-API-Token: ' . $token,
-    ]);
-
-    $result = ['A' => null, 'AAAA' => null];
-    foreach ($response['data']['records'] ?? [] as $record) {
-        if ($record['name'] === $hostnameName && in_array($record['type'], ['A', 'AAAA'], true)) {
-            $result[$record['type']] = $record['id'];
-        }
-    }
-
-    return $result;
-}
-
-function fetch_console_zone_id(string $endpoint, string $token, string $zoneName): ?string
+/**
+ * Resolve a zone name to its console id.
+ *
+ * Returns the standard ['success' => bool, ...] shape so callers can tell an
+ * authentication failure from a genuinely absent zone — returning null for both
+ * used to surface a 401 as a misleading "zone not found".
+ */
+function fetch_console_zone_id(string $endpoint, string $token, string $zoneName): array
 {
     $response = http_request('GET', $endpoint . '/zones?name=' . urlencode($zoneName), [
         'Content-Type: application/json',
         'Authorization: Bearer ' . $token,
     ]);
 
-    $zones = $response['data']['zones'] ?? [];
-    if (!empty($zones)) {
-        return $zones[0]['id'] ?? null;
+    if (!$response['success']) {
+        return ['success' => false, 'message' => 'Zone lookup failed: ' . ($response['error'] ?? 'unknown error')];
     }
 
-    return null;
+    $zoneId = $response['data']['zones'][0]['id'] ?? null;
+    if ($zoneId === null) {
+        return ['success' => false, 'message' => sprintf('Zone "%s" not found on console API', $zoneName)];
+    }
+
+    return ['success' => true, 'zone_id' => (string) $zoneId];
 }
 
+/**
+ * List the rrsets of one type. Propagates API errors instead of returning an empty
+ * list, which previously made an invalid token look like a missing rrset name.
+ */
 function fetch_console_rrsets(string $endpoint, string $token, string $zoneId, string $type): array
 {
     $response = http_request('GET', $endpoint . '/zones/' . urlencode($zoneId) . '/rrsets?type=' . urlencode($type), [
@@ -685,7 +570,11 @@ function fetch_console_rrsets(string $endpoint, string $token, string $zoneId, s
         'Authorization: Bearer ' . $token,
     ]);
 
-    return $response['data']['rrsets'] ?? $response['data'] ?? [];
+    if (!$response['success']) {
+        return ['success' => false, 'message' => sprintf('Rrset lookup (%s) failed: %s', $type, $response['error'] ?? 'unknown error')];
+    }
+
+    return ['success' => true, 'rrsets' => $response['data']['rrsets'] ?? []];
 }
 
 function choose_rrset_name(array $rrsets, array $candidates): ?string
@@ -761,6 +650,14 @@ function http_request(string $method, string $url, array $headers = [], $body = 
     $message = $error;
     if (!$message && !$success && is_array($data)) {
         $message = $data['error']['message'] ?? $data['error'] ?? null;
+    }
+
+    // A 2xx that is not JSON is not a success: a retired or misrouted endpoint
+    // answering 200 with an HTML page would otherwise be read as an empty result
+    // and reported as "zone not found" instead of naming the real problem.
+    if ($success && !is_array($data)) {
+        $success = false;
+        $message = sprintf('expected JSON but got %s (HTTP %d)', $responseBody === '' ? 'an empty body' : 'a non-JSON response', $status);
     }
 
     $bodySnippet = $responseBody !== false ? (strlen($responseBody) > 400 ? substr($responseBody, 0, 400) . '...' : $responseBody) : 'no body';
@@ -1063,7 +960,13 @@ function update_firewall(array $realmConfig, array $ips): array
     }
 
     $rules = $firewall['rules'];
-    $matched = 0;
+
+    // Collect matches first. Without a rule_description the filter is just
+    // direction+protocol+port, which can legitimately hit several rules (e.g. a
+    // static office allowlist on the same port). Rewriting those would silently
+    // hand someone else's access to this client, and set_rules makes it immediate,
+    // so refuse instead of guessing.
+    $matches = [];
     foreach ($rules as $index => $rule) {
         if (($rule['direction'] ?? '') !== 'in') {
             continue;
@@ -1077,6 +980,20 @@ function update_firewall(array $realmConfig, array $ips): array
         if ($fw['rule_description'] !== '' && (string) ($rule['description'] ?? '') !== $fw['rule_description']) {
             continue;
         }
+        $matches[] = $index;
+    }
+
+    if (count($matches) > 1 && $fw['rule_description'] === '') {
+        return ['success' => false, 'message' => sprintf(
+            'Firewall rule match is ambiguous: %d rules match in/%s port %s. Set firewall.rule_description to disambiguate.',
+            count($matches),
+            $fw['protocol'],
+            $fw['port']
+        )];
+    }
+
+    $matched = 0;
+    foreach ($matches as $index) {
         $rules[$index]['source_ips'] = $sourceIps;
         $matched++;
     }
@@ -1157,19 +1074,20 @@ function normalize_firewall_rules(array $rules): array
 }
 
 /**
- * Persist the latest IP/record state plus retry metadata so cron can resume work later.
+ * Persist the latest IP state plus retry metadata so the next attempt can resume.
+ *
+ * Columns are named explicitly, so databases created before the legacy DNS API was
+ * removed keep their now-unused recordA_id/recordAAAA_id columns without migration.
  */
-function upsert_history(SQLite3 $db, string $hostname, string $realm, array $ips, ?string $zoneId, ?string $recordAId, ?string $recordAAAAId, bool $needsSync, int $retryCount, ?string $lastError, ?int $pendingSince): void
+function upsert_history(SQLite3 $db, string $hostname, string $realm, array $ips, ?string $zoneId, bool $needsSync, int $retryCount, ?string $lastError, ?int $pendingSince): void
 {
-    $stmt = $db->prepare('INSERT INTO history (hostname, realm, ip, ip6, zone_id, recordA_id, recordAAAA_id, timestamp, needs_sync, retry_count, last_error, pending_since)
-        VALUES (:hostname, :realm, :ip, :ip6, :zone_id, :recordA_id, :recordAAAA_id, :timestamp, :needs_sync, :retry_count, :last_error, :pending_since)
+    $stmt = $db->prepare('INSERT INTO history (hostname, realm, ip, ip6, zone_id, timestamp, needs_sync, retry_count, last_error, pending_since)
+        VALUES (:hostname, :realm, :ip, :ip6, :zone_id, :timestamp, :needs_sync, :retry_count, :last_error, :pending_since)
         ON CONFLICT(hostname) DO UPDATE SET
         realm = excluded.realm,
         ip = excluded.ip,
         ip6 = excluded.ip6,
         zone_id = excluded.zone_id,
-        recordA_id = excluded.recordA_id,
-        recordAAAA_id = excluded.recordAAAA_id,
         timestamp = excluded.timestamp,
         needs_sync = excluded.needs_sync,
         retry_count = excluded.retry_count,
@@ -1181,8 +1099,6 @@ function upsert_history(SQLite3 $db, string $hostname, string $realm, array $ips
     $stmt->bindValue(':ip', $ips['ipv4'], SQLITE3_TEXT);
     $stmt->bindValue(':ip6', $ips['ipv6'], SQLITE3_TEXT);
     $stmt->bindValue(':zone_id', $zoneId ?? '', SQLITE3_TEXT);
-    $stmt->bindValue(':recordA_id', $recordAId ?? '', SQLITE3_TEXT);
-    $stmt->bindValue(':recordAAAA_id', $recordAAAAId ?? '', SQLITE3_TEXT);
     $stmt->bindValue(':timestamp', time(), SQLITE3_INTEGER);
     $stmt->bindValue(':needs_sync', $needsSync ? 1 : 0, SQLITE3_INTEGER);
     $stmt->bindValue(':retry_count', $retryCount, SQLITE3_INTEGER);
@@ -1213,7 +1129,7 @@ function process_pending_updates(SQLite3 $db, array $config, ?string $realmFilte
         $realmKey = $row['realm'] ?: get_default_realm_key($config);
 
         if (!isset($config['realms'][$realmKey])) {
-            upsert_history($db, $row['hostname'], $realmKey, ['ipv4' => $row['ip'], 'ipv6' => $row['ip6']], $row['zone_id'], $row['recordA_id'], $row['recordAAAA_id'], true, ($row['retry_count'] ?? 0), 'Realm removed', $row['pending_since']);
+            upsert_history($db, $row['hostname'], $realmKey, ['ipv4' => $row['ip'], 'ipv6' => $row['ip6']], $row['zone_id'], true, ($row['retry_count'] ?? 0), 'Realm removed', $row['pending_since']);
             $summary['details'][$row['hostname']] = ['status' => 'failed', 'message' => 'Realm not configured'];
             $summary['failed']++;
             continue;
@@ -1227,13 +1143,16 @@ function process_pending_updates(SQLite3 $db, array $config, ?string $realmFilte
             $hostnameName = $overriddenHostnameName === '' ? '@' : $overriddenHostnameName;
         }
         $ips = ['ipv4' => $row['ip'], 'ipv6' => $row['ip6']];
-        $result = sync_host($db, $config, $realmKey, $realmConfig, $row['hostname'], $domain, $zoneLookupName, $hostnameName, $ips, $row);
-        if ($result['success']) {
+        // Deliberately NOT named $result: that variable holds the SQLite3Result the
+        // while condition above iterates. Overwriting it killed the loop after the
+        // first pending host with "fetchArray() on array".
+        $syncResult = sync_host($db, $config, $realmKey, $realmConfig, $row['hostname'], $zoneLookupName, $hostnameName, $ips, $row);
+        if ($syncResult['success']) {
             $summary['success']++;
-            $summary['details'][$row['hostname']] = ['status' => 'success', 'api' => $result['api_used'] ?? $result['api'] ?? 'unknown'];
+            $summary['details'][$row['hostname']] = ['status' => 'success'];
         } else {
             $summary['failed']++;
-            $summary['details'][$row['hostname']] = ['status' => 'failed', 'message' => $result['message']];
+            $summary['details'][$row['hostname']] = ['status' => 'failed', 'message' => $syncResult['message']];
         }
     }
 
@@ -1249,10 +1168,6 @@ function render_cron_summary(array $summary): string
     // Append a line per hostname to clarify which API handled the retry or why it still fails.
     foreach ($summary['details'] as $hostname => $detail) {
         $line = " - $hostname: {$detail['status']}";
-        $api = $detail['api'] ?? $detail['api_used'] ?? null;
-        if ($api) {
-            $line .= ' via ' . $api;
-        }
         if (!empty($detail['message'])) {
             $line .= ' (' . $detail['message'] . ')';
         }
@@ -1266,7 +1181,19 @@ class DDnsDB extends SQLite3
 {
     public function __construct(array $config)
     {
-        $this->open($config['history_db']);
+        // Fail loudly instead of warning: a corrupt or unwritable database would
+        // otherwise emit a cascade of warnings and let the request limp on with a
+        // broken handle — and a failed INSERT would still answer "good". The
+        // top-level exception handler turns any of that into a clean 500.
+        // (Not switched back afterwards: enableExceptions(false) is deprecated as
+        // of PHP 8.3, and the notice would itself start output prematurely.)
+        $this->enableExceptions(true);
+
+        // Without the fallback a config missing this key would yield null, and
+        // SQLite3::open(null) silently opens a *temporary* database: every request
+        // would start empty and needs_sync would never persist. Matches the default
+        // used by hetzner_dyndns_listhosts.php.
+        $this->open($config['history_db'] ?? (__DIR__ . '/hetzner_dyndns.sqlite3'));
         $this->busyTimeout(5000);
         $this->exec('PRAGMA foreign_keys = ON');
         $this->exec('PRAGMA journal_mode = WAL');
@@ -1288,8 +1215,6 @@ class DDnsDB extends SQLite3
             ip TEXT,
             ip6 TEXT,
             zone_id TEXT,
-            recordA_id TEXT,
-            recordAAAA_id TEXT,
             timestamp INTEGER,
             needs_sync INTEGER DEFAULT 0,
             retry_count INTEGER DEFAULT 0,
