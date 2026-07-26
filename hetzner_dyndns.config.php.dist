@@ -27,6 +27,13 @@ return [
     // what makes state survive between requests.
     'history_db' => __DIR__ . '/hetzner_dyndns.sqlite3',
 
+    // Networks whose X-Forwarded-For header may be believed when a client does
+    // not send an explicit "myip". Omit this key to use the defaults (loopback
+    // plus all private ranges), which already cover Docker/Traefik/Caddy. Set it
+    // when a reverse proxy in front of you has a public address — otherwise its
+    // header is ignored and the proxy's own IP would end up in the record.
+    // 'trusted_proxies' => ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'],
+
     // Enable verbose output when troubleshooting (false for production).
     'debug' => false,
 

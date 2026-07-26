@@ -69,7 +69,7 @@ if (!valid_hostname($hostname)) {
     exit('Invalid domain name');
 }
 
-$ipSource = $_GET['myip'] ?? resolve_client_ip();
+$ipSource = $_GET['myip'] ?? resolve_client_ip($config);
 $ips = parse_ip_list($ipSource);
 if (!$ips['ipv4']) {
     exit('No valid IPv4 address provided');
@@ -264,15 +264,132 @@ function send_auth_headers(string $realm): void
     exit('Unauthorized');
 }
 
-function resolve_client_ip(): ?string
+/**
+ * Determine the client address when no explicit `myip` was supplied.
+ *
+ * Each reverse proxy APPENDS itself to X-Forwarded-For, so the chain reads
+ * "client, proxy1, proxy2" — the client is on the left, infrastructure on the
+ * right. Returning the raw header made parse_ip_list() pick the *last* address,
+ * i.e. the nearest proxy: behind Traefik + Caddy that stored Traefik's private
+ * container IP as the DNS record.
+ *
+ * Taking the leftmost entry instead would be spoofable, because a client can
+ * send its own X-Forwarded-For that the proxies then append to. So:
+ *   1. Ignore the header entirely unless the peer (REMOTE_ADDR) is a trusted proxy.
+ *   2. Otherwise walk the chain right-to-left and return the first address that
+ *      is not itself a trusted proxy — that is the closest untrusted client.
+ */
+function resolve_client_ip(array $config): ?string
 {
-    if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-        return $_SERVER['HTTP_X_FORWARDED_FOR'];
+    $remote = $_SERVER['REMOTE_ADDR'] ?? null;
+    $forwarded = trim((string) ($_SERVER['HTTP_X_FORWARDED_FOR'] ?? ''));
+    $trusted = get_trusted_proxies($config);
+
+    if ($forwarded === '' || $remote === null || !ip_in_ranges($remote, $trusted)) {
+        // No proxy in front (or an untrusted one): the peer is the client.
+        log_debug(sprintf('Client address taken from REMOTE_ADDR (%s)', $remote ?? 'unset'));
+
+        return $remote;
     }
-    if (!empty($_SERVER['REMOTE_ADDR'])) {
-        return $_SERVER['REMOTE_ADDR'];
+
+    $chain = array_map('trim', explode(',', $forwarded));
+    for ($i = count($chain) - 1; $i >= 0; $i--) {
+        if (!filter_var($chain[$i], FILTER_VALIDATE_IP)) {
+            continue;
+        }
+        if (!ip_in_ranges($chain[$i], $trusted)) {
+            log_debug(sprintf('Client address %s taken from X-Forwarded-For "%s"', $chain[$i], $forwarded));
+
+            return $chain[$i];
+        }
     }
-    return null;
+
+    // Every hop looked like a trusted proxy — e.g. the client sits on the same
+    // private LAN. The leftmost valid entry is then the best available answer.
+    foreach ($chain as $candidate) {
+        if (filter_var($candidate, FILTER_VALIDATE_IP)) {
+            log_debug(sprintf('X-Forwarded-For "%s" is all-trusted; using leftmost entry %s', $forwarded, $candidate));
+
+            return $candidate;
+        }
+    }
+
+    return $remote;
+}
+
+/**
+ * Networks whose X-Forwarded-For header may be believed. Defaults to loopback
+ * plus the private ranges, which covers the usual Docker/Traefik/Caddy setup;
+ * override via 'trusted_proxies' when a proxy sits on a public address.
+ *
+ * @return list<string>
+ */
+function get_trusted_proxies(array $config): array
+{
+    $configured = $config['trusted_proxies'] ?? null;
+    if (is_array($configured)) {
+        return array_values(array_filter(array_map('strval', $configured)));
+    }
+
+    return ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '::1/128', 'fc00::/7', 'fe80::/10'];
+}
+
+/** @param list<string> $ranges IP addresses or CIDR blocks, IPv4 or IPv6. */
+function ip_in_ranges(string $ip, array $ranges): bool
+{
+    $binary = @inet_pton($ip);
+    if ($binary === false) {
+        return false;
+    }
+
+    foreach ($ranges as $range) {
+        if (ip_in_range($binary, $range)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/** @param string $binary Packed address as returned by inet_pton(). */
+function ip_in_range(string $binary, string $range): bool
+{
+    $range = trim($range);
+    if ($range === '') {
+        return false;
+    }
+
+    if (strpos($range, '/') === false) {
+        $single = @inet_pton($range);
+
+        return $single !== false && $single === $binary;
+    }
+
+    [$subnet, $bits] = explode('/', $range, 2);
+    $subnetBinary = @inet_pton(trim($subnet));
+    if ($subnetBinary === false || strlen($subnetBinary) !== strlen($binary)) {
+        // Different address family, so it cannot match.
+        return false;
+    }
+
+    $bits = (int) $bits;
+    if ($bits < 0 || $bits > strlen($binary) * 8) {
+        return false;
+    }
+
+    $wholeBytes = intdiv($bits, 8);
+    if ($wholeBytes > 0 && strncmp($binary, $subnetBinary, $wholeBytes) !== 0) {
+        return false;
+    }
+
+    $remainingBits = $bits % 8;
+    if ($remainingBits === 0) {
+        return true;
+    }
+
+    $mask = chr((0xFF << (8 - $remainingBits)) & 0xFF);
+
+    return ($binary[$wholeBytes] & $mask) === ($subnetBinary[$wholeBytes] & $mask);
 }
 
 function parse_ip_list(?string $ip): array

@@ -9,7 +9,7 @@
 # the Hetzner API token and the DynDNS password and is therefore deliberately
 # not part of the repository.
 services:
-  ddns-fpm:
+  dyndns-fpm:
     build: .
     image: hetzner-dyndns-fpm:latest
     restart: unless-stopped
@@ -22,22 +22,37 @@ services:
       - ${DYNDNS_CONFIG:?set DYNDNS_CONFIG to the absolute path of hetzner_dyndns.config.php}:/var/www/html/hetzner_dyndns.config.php:ro
       # Survives image rebuilds; holds the sqlite database.
       - dyndns-data:/var/www/data
+    networks:
+      - dyndns_internal
 
-  ddns-caddy:
+  dyndns-caddy:
     image: caddy:2-alpine
     restart: unless-stopped
     depends_on:
-      - ddns-fpm
-    ports:
-      - "${DYNDNS_HTTP_PORT:-8080}:80"
+      - dyndns-fpm
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       # Caddy needs no access to the application files: php_fastcgi forwards by
       # path, and the Caddyfile serves nothing from disk.
       - caddy-data:/data
       - caddy-config:/config
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=http_network"
+      - "traefik.http.routers.dyndns.rule=Host(`${DYNDNS_HOST:?set DYNDNS_HOST to the hostname you want to update with Hetzner's DynDNS service}`)"
+      - "traefik.http.routers.dyndns.entrypoints=https"
+      - "traefik.http.routers.dyndns.tls=true"
+      - "traefik.http.services.dyndns.loadbalancer.server.port=80"
+    networks:
+      - dyndns_internal
+      - http_network
 
 volumes:
   dyndns-data:
   caddy-data:
   caddy-config:
+
+networks:
+  dyndns_internal:
+  http_network:
+    external: true

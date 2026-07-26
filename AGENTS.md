@@ -59,6 +59,8 @@ The API addresses **rrsets by name+type**, not individual records by ID, and wri
 
 A firewall failure sets `needs_sync = 1`, so the next client poll retries record + firewall even with an unchanged IP.
 
+**Client address behind proxies.** `myip` always wins. Without it, `resolve_client_ip()` ignores `X-Forwarded-For` unless `REMOTE_ADDR` is itself a trusted proxy, then walks the chain **right-to-left** and returns the first entry that is not a trusted proxy. Both halves matter: each hop *appends* itself, so the raw header made `parse_ip_list()` pick the last address — behind Traefik + Caddy that stored Traefik's private container IP as the record — while blindly taking the leftmost entry would be spoofable, since a client can send its own header for the proxies to append to. Trusted ranges come from `trusted_proxies` (default: loopback + RFC1918/ULA), matched by `ip_in_ranges()`, which handles IPv4 and IPv6 CIDR.
+
 **Zone vs. record name.** `split_hostname()` naively assumes the last two labels are the domain, which is wrong for subdomain zones and multi-part TLDs. The `zone_name` realm override plus `derive_hostname_name_from_zone()` recompute the record name relative to the real zone and override the naive split. Any hostname-parsing change must keep both the HTTP branch and `process_pending_updates()` in sync — they duplicate this sequence.
 
 **SQLite is cache *and* retry queue.** The `history` table (keyed by hostname) stores the last known IPs, the resolved `zone_id`, and `needs_sync`/`retry_count`/`pending_since`. Consequences worth knowing:

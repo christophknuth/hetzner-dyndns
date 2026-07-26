@@ -21,7 +21,7 @@
 	@dyndns path /nic/update /v3/update
 	handle @dyndns {
 		rewrite * /hetzner_dyndns.php
-		php_fastcgi ddns-fpm:9000
+		php_fastcgi dyndns-fpm:9000
 	}
 
 	handle {
