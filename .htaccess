@@ -12,8 +12,13 @@ RewriteRule ^.*$ hetzner_dyndns.php [L,QSA]
 RewriteCond %{THE_REQUEST} \s/hetzner_dyndns\.php\s [NC]
 RewriteRule ^hetzner_dyndns\.php$ - [F,L]
 
-# Disallow access to .htaccess, .htpasswd, config templates, log files, and other sensitive files
-RewriteRule ^(\.htaccess|\.htpasswd|\.sqlite3|\.ini|\.env|\.gitignore|\.log|hetzner_dyndns\.config\.php|hetzner_dyndns\.config\.php\.dist|hetzner_dyndns\.debug\.log)$ - [F,L]
+# Disallow dotfiles (.htaccess, .htpasswd, .gitignore, .env, ...) in any directory.
+RewriteRule (^|/)\. - [F,L]
+
+# Disallow sensitive file types by SUFFIX, not by literal name: the database is
+# called hetzner_dyndns.sqlite3, so an anchored "\.sqlite3$" alternative would
+# never have matched it. Covers files added later without further edits.
+RewriteRule \.(sqlite3|sqlite3-wal|sqlite3-shm|db|log|ini|env|dist|bak|swp)$ - [F,L]
 
 # Disallow direct access to any PHP file except the rewrite-driven DynDNS endpoints.
 RewriteCond %{THE_REQUEST} !/nic/update

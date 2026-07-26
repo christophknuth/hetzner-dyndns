@@ -1,3 +1,4 @@
 *.sqlite3
 *.log
 hetzner_dyndns.config.php
+/.env

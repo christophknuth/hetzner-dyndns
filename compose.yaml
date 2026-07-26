@@ -1,0 +1,43 @@
+# Dockhand stack for hetzner-dyndns, imported directly from GitHub.
+#
+# Dockhand clones this repository into the stack directory, so `build: .` uses
+# the repository itself as the build context and ./Caddyfile is mounted from
+# the same checkout — image and configuration always match the deployed commit.
+#
+# Before the first start, create hetzner_dyndns.config.php on the Docker host
+# (copy hetzner_dyndns.config.php.dist) and point DYNDNS_CONFIG at it. It holds
+# the Hetzner API token and the DynDNS password and is therefore deliberately
+# not part of the repository.
+services:
+  ddns-fpm:
+    build: .
+    image: hetzner-dyndns-fpm:latest
+    restart: unless-stopped
+    expose:
+      - "9000"
+    volumes:
+      # Fails fast with a readable message if unset — without it Docker would
+      # silently create a *directory* at the mount point and the app would die
+      # on a confusing "failed to open stream" error.
+      - ${DYNDNS_CONFIG:?set DYNDNS_CONFIG to the absolute path of hetzner_dyndns.config.php}:/var/www/html/hetzner_dyndns.config.php:ro
+      # Survives image rebuilds; holds the sqlite database.
+      - dyndns-data:/var/www/data
+
+  ddns-caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - ddns-fpm
+    ports:
+      - "${DYNDNS_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Caddy needs no access to the application files: php_fastcgi forwards by
+      # path, and the Caddyfile serves nothing from disk.
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  dyndns-data:
+  caddy-data:
+  caddy-config:

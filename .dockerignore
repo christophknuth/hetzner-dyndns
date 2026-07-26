@@ -1,0 +1,6 @@
+# The Dockerfile copies the two application scripts explicitly; everything else
+# is excluded so the build context stays small and a local config or database
+# can never end up in an image layer.
+*
+!hetzner_dyndns.php
+!hetzner_dyndns_listhosts.php
