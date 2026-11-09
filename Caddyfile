@@ -14,14 +14,17 @@
 # For direct exposure, replace :80 with the hostname so Caddy provisions TLS:
 #   dyndns.example.com { ... }
 :80 {
-	# Needed so SCRIPT_FILENAME resolves inside the FPM container, even though
-	# Caddy itself never reads from this directory.
-	root * /var/www/html
-
 	@dyndns path /nic/update /v3/update
 	handle @dyndns {
 		rewrite * /hetzner_dyndns.php
-		php_fastcgi dyndns-fpm:9000
+		# reverse_proxy skips the try_files check of php_fastcgi, which would
+		# require the script to exist on Caddy's own filesystem.
+		reverse_proxy dyndns-fpm:9000 {
+			transport fastcgi {
+				root /var/www/html
+				split .php
+			}
+		}
 	}
 
 	handle {
